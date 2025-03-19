@@ -1,2 +1,3 @@
 .env
+**/node_modules/
 backend/data/201812-citibike-tripdata.csv
