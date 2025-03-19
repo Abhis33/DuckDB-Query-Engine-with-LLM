@@ -1,4 +1,7 @@
 pandas==2.2.0
+flask
+flask-cors
 duckdb==0.10.0
 openai
+typing-extensions
 python-dotenv==1.0.1
