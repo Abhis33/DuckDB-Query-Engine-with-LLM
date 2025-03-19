@@ -1,178 +1,130 @@
 import os
 import json
-import logging
-from typing import List, Dict, Any, Optional, Tuple
-import pandas as pd
-import duckdb
-from openai import OpenAI
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from typing import Dict, List, Any
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Import the existing DuckDB LLM Query Engine
+from duckdb_llm import DuckDBLLMQueryEngine
 
-class DuckDBLLMQueryEngine:
-    """A class that integrates DuckDB with OpenAI's LLM for natural language to SQL translation."""
+app = Flask(__name__, static_folder='../frontend/build')
+CORS(app)  # Enable CORS for all routes
 
-    def __init__(self, openai_api_key: str, database_path: str = ":memory:"):
-        """
-        Initialize the DuckDB LLM Query Engine.
+# Initialize the query engine
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-        Args:
-            openai_api_key: API key for OpenAI
-            database_path: Path to DuckDB database file (defaults to in-memory database)
-        """
-        # Set API key as environment variable instead of passing to client
-        os.environ["OPENAI_API_KEY"] = openai_api_key
+engine = DuckDBLLMQueryEngine(api_key)
 
-        # Initialize client without any arguments
-        self.client = OpenAI()
+# Load sample data by default
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
 
-        self.conn = duckdb.connect(database_path)
-        self.schema_info = None
-        logger.info("DuckDB LLM Query Engine initialized")
+@app.route('/api/load-csv', methods=['POST'])
+def load_csv():
+    """API endpoint to load CSV files from data directory"""
+    try:
+        data = request.json
+        file_paths = data.get('file_paths', {})
 
-    def load_csv_files(self, file_paths: Dict[str, str]) -> None:
-        """
-        Load CSV files into DuckDB tables.
+        # Convert relative paths to absolute paths
+        absolute_paths = {table: os.path.join(DATA_DIR, path)
+                          for table, path in file_paths.items()}
 
-        Args:
-            file_paths: Dictionary mapping table names to CSV file paths
-        """
-        for table_name, file_path in file_paths.items():
-            try:
-                self.conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{file_path}')")
-                logger.info(f"Loaded {file_path} into table {table_name}")
-            except Exception as e:
-                logger.error(f"Error loading {file_path}: {str(e)}")
-                raise
+        engine.load_csv_files(absolute_paths)
+        engine.extract_schema_info()
 
-    def extract_schema_info(self) -> Dict[str, List[Dict[str, str]]]:
-        """Extract schema information from DuckDB database."""
-        tables = self.conn.execute("SHOW TABLES").fetchall()
-        schema_info = {}
+        return jsonify({
+            'success': True,
+            'message': f"Loaded {len(file_paths)} tables",
+            'schema': engine.schema_info
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-        for table in tables:
-            table_name = table[0]
-            columns = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            schema_info[table_name] = [
-                {"name": col[1], "type": col[2]} for col in columns
-            ]
+@app.route('/api/schema', methods=['GET'])
+def get_schema():
+    """API endpoint to get database schema information"""
+    try:
+        if not engine.schema_info:
+            engine.extract_schema_info()
 
-            # Add a sample of data for better context
-            sample_data = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchall()
-            sample_str = "\n".join(str(row) for row in sample_data)
-            schema_info[f"{table_name}_sample"] = sample_str
+        return jsonify({
+            'success': True,
+            'schema': engine.schema_info
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-        self.schema_info = schema_info
-        return schema_info
+@app.route('/api/query', methods=['POST'])
+def execute_query():
+    """API endpoint to execute a natural language query"""
+    try:
+        data = request.json
+        question = data.get('question')
 
-    def generate_sql_from_question(self, question: str) -> str:
-        """
-        Generate SQL from a natural language question using OpenAI's LLM.
+        if not question:
+            return jsonify({
+                'success': False,
+                'error': 'No question provided'
+            }), 400
 
-        Args:
-            question: Natural language question to convert to SQL
+        # Generate SQL and execute the query
+        result, sql, message = engine.query_from_natural_language(question)
 
-        Returns:
-            SQL query string
-        """
-        if not self.schema_info:
-            self.extract_schema_info()
+        # Convert DataFrame to JSON
+        result_json = result.to_dict(orient='records')
 
-        prompt = self._create_sql_generation_prompt(question)
+        return jsonify({
+            'success': True,
+            'sql': sql,
+            'result': result_json,
+            'message': message,
+            'columns': list(result.columns)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a SQL expert that converts natural language questions into DuckDB SQL queries. Only respond with the SQL query and nothing else."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                max_tokens=500
-            )
+@app.route('/api/files', methods=['GET'])
+def list_files():
+    """API endpoint to list available CSV files in the data directory"""
+    try:
+        files = []
+        for file in os.listdir(DATA_DIR):
+            if file.endswith('.csv'):
+                files.append(file)
 
-            sql_query = response.choices[0].message.content.strip()
+        return jsonify({
+            'success': True,
+            'files': files
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-            # Sometimes the model returns the SQL with markdown formatting - remove it
-            if sql_query.startswith("```sql"):
-                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+@app.route('/api/load-sample', methods=['POST'])
+def load_sample_data():
+    """API endpoint to load sample data"""
+    try:
+        # Create sample data directory if it doesn't exist
+        os.makedirs(DATA_DIR, exist_ok=True)
 
-            logger.info(f"Generated SQL query: {sql_query}")
-            return sql_query
+        # Create sample data files
+        employees_path = os.path.join(DATA_DIR, "employees.csv")
+        departments_path = os.path.join(DATA_DIR, "departments.csv")
 
-        except Exception as e:
-            logger.error(f"Error generating SQL: {str(e)}")
-            raise
-
-    def _create_sql_generation_prompt(self, question: str) -> str:
-        """Create a prompt for the LLM with schema information and the question."""
-        schema_str = json.dumps(self.schema_info, indent=2)
-
-        prompt = f"""
-Given the following DuckDB database schema:
-
-{schema_str}
-
-Convert this question into a DuckDB SQL query:
-"{question}"
-
-Only return the SQL query, without any explanation or markdown formatting.
-Ensure the query is valid DuckDB SQL syntax.
-"""
-        return prompt
-
-    def execute_query(self, query: str) -> Tuple[pd.DataFrame, str]:
-        """
-        Execute a SQL query against DuckDB.
-
-        Args:
-            query: SQL query string
-
-        Returns:
-            Tuple of (result DataFrame, query execution message)
-        """
-        try:
-            result = self.conn.execute(query).fetchdf()
-            message = f"Query executed successfully. Returned {len(result)} rows."
-            logger.info(message)
-            return result, message
-        except Exception as e:
-            error_msg = f"Error executing query: {str(e)}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-    def query_from_natural_language(self, question: str) -> Tuple[pd.DataFrame, str, str]:
-        """
-        Process a natural language question, generate SQL, and return results.
-
-        Args:
-            question: Natural language question
-
-        Returns:
-            Tuple of (result DataFrame, generated SQL query, execution message)
-        """
-        sql_query = self.generate_sql_from_question(question)
-        result, message = self.execute_query(sql_query)
-        return result, sql_query, message
-
-    def close(self):
-        """Close the DuckDB connection."""
-        self.conn.close()
-        logger.info("DuckDB connection closed")
-
-
-class QueryApp:
-    """Simple application to interact with the DuckDB LLM Query Engine."""
-
-    def __init__(self, openai_api_key: str, database_path: str = ":memory:"):
-        """Initialize the application with the query engine."""
-        self.engine = DuckDBLLMQueryEngine(openai_api_key, database_path)
-
-    def load_sample_data(self):
-        """Load some sample data for testing."""
-        # Create a temporary CSV file
-        with open("employees.csv", "w") as f:
+        with open(employees_path, "w") as f:
             f.write("id,name,department,salary,join_date\n")
             f.write("1,John Smith,Engineering,85000,2020-01-15\n")
             f.write("2,Jane Doe,Marketing,75000,2019-05-20\n")
@@ -180,58 +132,41 @@ class QueryApp:
             f.write("4,Alice Williams,Sales,65000,2021-07-05\n")
             f.write("5,Charlie Brown,Engineering,80000,2020-02-28\n")
 
-        with open("departments.csv", "w") as f:
+        with open(departments_path, "w") as f:
             f.write("id,name,budget,location\n")
             f.write("1,Engineering,1000000,New York\n")
             f.write("2,Marketing,500000,San Francisco\n")
             f.write("3,Sales,750000,Chicago\n")
             f.write("4,HR,300000,New York\n")
 
-        self.engine.load_csv_files({
-            "employees": "employees.csv",
-            "departments": "departments.csv"
+        # Load the files into DuckDB
+        engine.load_csv_files({
+            "employees": employees_path,
+            "departments": departments_path
         })
 
-        self.engine.extract_schema_info()
+        # Extract schema information
+        engine.extract_schema_info()
 
-    def run_query(self, question: str):
-        """Run a natural language query and print results."""
-        try:
-            result, sql, message = self.engine.query_from_natural_language(question)
-            print("\n=== Generated SQL ===")
-            print(sql)
-            print("\n=== Result ===")
-            print(result)
-            print(f"\n{message}")
-            return result
-        except Exception as e:
-            print(f"Error: {str(e)}")
-            return None
+        return jsonify({
+            'success': True,
+            'message': 'Sample data loaded successfully',
+            'schema': engine.schema_info
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-    def interactive_mode(self):
-        """Run an interactive query session."""
-        print("=== DuckDB LLM Query Engine ===")
-        print("Type your questions in natural language, or 'exit' to quit.")
+# Serve React frontend static files
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path and os.path.exists(app.static_folder + '/' + path):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
 
-        while True:
-            question = input("\nQuestion: ")
-            if question.lower() in ["exit", "quit", "q"]:
-                break
-            self.run_query(question)
-
-    def close(self):
-        """Close the application."""
-        self.engine.close()
-
-
-# Example usage
-if __name__ == "__main__":
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_api_key:
-        print("Please set the OPENAI_API_KEY environment variable")
-        exit(1)
-
-    app = QueryApp(openai_api_key)
-    app.load_sample_data()
-    app.interactive_mode()
-    app.close()
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
